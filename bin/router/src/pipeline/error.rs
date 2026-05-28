@@ -11,7 +11,7 @@ use hive_router_plan_executor::{
     headers::errors::HeaderRuleRuntimeError,
     hooks::on_graphql_error::handle_graphql_errors_with_plugins,
     request_context::RequestContextError,
-    response::graphql_error::GraphQLError,
+    response::graphql_error::{GraphQLError, GraphQLErrorCostExtension},
 };
 use hive_router_query_planner::{
     ast::normalization::error::NormalizationError, planner::PlannerError,
@@ -164,6 +164,11 @@ pub enum PipelineError {
     #[strum(serialize = "NO_SUPERGRAPH_AVAILABLE")]
     NoSupergraphAvailable,
 
+    // Demand Control
+    #[error("Operation estimated cost {estimated_cost} exceeds configured max cost {max_cost}")]
+    #[strum(serialize = "COST_ESTIMATED_TOO_EXPENSIVE")]
+    CostEstimatedTooExpensive { estimated_cost: u64, max_cost: u64 },
+
     #[error(transparent)]
     CoprocessorError(#[from] CoprocessorError),
 
@@ -244,6 +249,8 @@ impl PipelineError {
             (Self::MutationNotAllowedOverHttpGet, _) => StatusCode::METHOD_NOT_ALLOWED,
             (Self::ValidationErrors(_), true) => StatusCode::OK,
             (Self::ValidationErrors(_), false) => StatusCode::BAD_REQUEST,
+            (Self::CostEstimatedTooExpensive { .. }, true) => StatusCode::OK,
+            (Self::CostEstimatedTooExpensive { .. }, false) => StatusCode::BAD_REQUEST,
             (Self::AuthorizationFailed(_), _) => StatusCode::FORBIDDEN,
             (Self::MissingContentTypeHeader, _) => StatusCode::NOT_ACCEPTABLE,
             (Self::UnsupportedContentType, _) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -295,6 +302,23 @@ pub fn handle_pipeline_error(
             .iter()
             .map(|error| error.into())
             .collect(),
+        PipelineError::CostEstimatedTooExpensive {
+            ref estimated_cost,
+            ref max_cost,
+        } => {
+            // Surface the cost numbers to the client on the global
+            // estimated-cost rejection so operators can correlate them
+            // with the configured `max`.
+            let mut graphql_error = GraphQLError::from_message_and_code(
+                err.graphql_error_message(),
+                "COST_ESTIMATED_TOO_EXPENSIVE",
+            );
+            graphql_error.extensions.cost = Some(GraphQLErrorCostExtension {
+                estimated: *estimated_cost,
+                max: *max_cost,
+            });
+            vec![graphql_error]
+        }
         _ => {
             let code = err.graphql_error_code();
             let message = err.graphql_error_message();
